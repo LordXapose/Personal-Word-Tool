@@ -1,0 +1,1424 @@
+import sys
+import os
+import re
+import tempfile
+import zipfile
+import shutil
+from pathlib import Path
+
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import (
+    QAction,
+    QFont,
+    QColor,
+    QTextCursor,
+    QTextCharFormat,
+    QTextBlockFormat,
+    QTextListFormat,
+    QTextDocument,
+    QTextImageFormat,
+    QImage,
+    QDesktopServices,
+)
+from PySide6.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QTextEdit,
+    QFileDialog,
+    QMessageBox,
+    QToolBar,
+    QComboBox,
+    QColorDialog,
+    QInputDialog,
+    QStatusBar,
+    QLabel,
+    QDialog,
+    QVBoxLayout,
+    QHBoxLayout,
+    QLineEdit,
+    QPushButton,
+)
+
+from docx import Document
+from docx.shared import Pt, RGBColor, Inches
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+
+
+APP_NAME = "MyWord"
+VERSION = "2.0"
+
+
+# ============================================================
+# FIND / REPLACE
+# ============================================================
+
+class FindReplaceDialog(QDialog):
+    def __init__(self, editor, parent=None):
+        super().__init__(parent)
+        self.editor = editor
+        self.setWindowTitle("Find & Replace")
+        self.setMinimumWidth(560)
+
+        layout = QVBoxLayout(self)
+
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Find:"))
+        self.find_input = QLineEdit()
+        self.find_input.setPlaceholderText("Text to find...")
+        row1.addWidget(self.find_input)
+        layout.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Replace:"))
+        self.replace_input = QLineEdit()
+        self.replace_input.setPlaceholderText("Replacement...")
+        row2.addWidget(self.replace_input)
+        layout.addLayout(row2)
+
+        buttons = QHBoxLayout()
+        for text, slot in (
+            ("Find Next", self.find_next),
+            ("Replace", self.replace_one),
+            ("Replace All", self.replace_all),
+            ("Close", self.close),
+        ):
+            b = QPushButton(text)
+            b.clicked.connect(slot)
+            buttons.addWidget(b)
+        layout.addLayout(buttons)
+
+        self.find_input.returnPressed.connect(self.find_next)
+
+    def find_next(self):
+        text = self.find_input.text()
+        if not text:
+            return
+
+        if not self.editor.find(text):
+            cursor = self.editor.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.Start)
+            self.editor.setTextCursor(cursor)
+            if not self.editor.find(text):
+                QMessageBox.information(
+                    self, "Find", f'Could not find "{text}".'
+                )
+
+    def replace_one(self):
+        find_text = self.find_input.text()
+        replace_text = self.replace_input.text()
+        if not find_text:
+            return
+
+        cursor = self.editor.textCursor()
+        if cursor.hasSelection() and cursor.selectedText() == find_text:
+            cursor.insertText(replace_text)
+        else:
+            self.find_next()
+
+    def replace_all(self):
+        find_text = self.find_input.text()
+        replace_text = self.replace_input.text()
+        if not find_text:
+            return
+
+        document = self.editor.document()
+        cursor = QTextCursor(document)
+        count = 0
+
+        cursor.beginEditBlock()
+        while True:
+            cursor = document.find(find_text, cursor)
+            if cursor.isNull():
+                break
+            cursor.insertText(replace_text)
+            count += 1
+        cursor.endEditBlock()
+
+        QMessageBox.information(
+            self,
+            "Replace All",
+            f"Replaced {count} occurrence(s)."
+            if count
+            else f'Could not find "{find_text}".',
+        )
+
+
+# ============================================================
+# DOCX HELPERS
+# ============================================================
+
+def rgb_from_run(run):
+    try:
+        if run.font.color and run.font.color.rgb:
+            return str(run.font.color.rgb)
+    except Exception:
+        pass
+    return None
+
+
+def set_cell_shading(cell, fill):
+    tc_pr = cell._tc.get_or_add_tcPr()
+    shd = tc_pr.find(qn("w:shd"))
+    if shd is None:
+        shd = OxmlElement("w:shd")
+        tc_pr.append(shd)
+    shd.set(qn("w:fill"), fill)
+
+
+def set_cell_margins(cell, top=80, start=80, bottom=80, end=80):
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    tcMar = tcPr.first_child_found_in("w:tcMar")
+    if tcMar is None:
+        tcMar = OxmlElement("w:tcMar")
+        tcPr.append(tcMar)
+
+    for m, value in (
+        ("top", top),
+        ("start", start),
+        ("bottom", bottom),
+        ("end", end),
+    ):
+        node = tcMar.find(qn(f"w:{m}"))
+        if node is None:
+            node = OxmlElement(f"w:{m}")
+            tcMar.append(node)
+        node.set(qn("w:w"), str(value))
+        node.set(qn("w:type"), "dxa")
+
+
+def add_hyperlink(paragraph, text, url, color="0563C1", underline=True):
+    part = paragraph.part
+    r_id = part.relate_to(
+        url,
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink",
+        is_external=True,
+    )
+
+    hyperlink = OxmlElement("w:hyperlink")
+    hyperlink.set(qn("r:id"), r_id)
+
+    new_run = OxmlElement("w:r")
+    rPr = OxmlElement("w:rPr")
+
+    if color:
+        c = OxmlElement("w:color")
+        c.set(qn("w:val"), color)
+        rPr.append(c)
+
+    if underline:
+        u = OxmlElement("w:u")
+        u.set(qn("w:val"), "single")
+        rPr.append(u)
+
+    new_run.append(rPr)
+    t = OxmlElement("w:t")
+    t.text = text
+    new_run.append(t)
+    hyperlink.append(new_run)
+    paragraph._p.append(hyperlink)
+
+
+# ============================================================
+# MYWORD
+# ============================================================
+
+class MyWord(QMainWindow):
+    def __init__(self):
+        super().__init__()
+
+        self.current_file = None
+        self.modified = False
+        self.loading = False
+
+        self.document_header = ""
+        self.document_footer = ""
+
+        self.setWindowTitle("Untitled - MyWord")
+        self.resize(1300, 900)
+
+        self.setup_editor()
+        self.create_actions()
+        self.create_menus()
+        self.create_toolbar()
+        self.create_statusbar()
+
+        self.new_document(force=True)
+
+    # --------------------------------------------------------
+    # EDITOR
+    # --------------------------------------------------------
+
+    def setup_editor(self):
+        self.editor = QTextEdit()
+        self.editor.setAcceptRichText(True)
+        self.editor.setUndoRedoEnabled(True)
+        self.editor.setFont(QFont("Arial", 12))
+        self.editor.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+
+        self.editor.setStyleSheet("""
+            QTextEdit {
+                background: white;
+                color: black;
+                border: 1px solid #cfcfcf;
+                padding: 45px;
+                selection-background-color: #3399ff;
+            }
+        """)
+
+        self.setCentralWidget(self.editor)
+
+        self.editor.textChanged.connect(self.document_changed)
+        self.editor.cursorPositionChanged.connect(self.update_toolbar)
+
+        self.editor.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                if url.isLocalFile():
+                    ext = Path(url.toLocalFile()).suffix.lower()
+                    if ext in (".docx", ".txt"):
+                        event.acceptProposedAction()
+                        return
+        event.ignore()
+
+    def dropEvent(self, event):
+        for url in event.mimeData().urls():
+            if url.isLocalFile():
+                path = url.toLocalFile()
+                if Path(path).suffix.lower() in (".docx", ".txt"):
+                    if self.check_unsaved_changes():
+                        self.open_file_path(path)
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+
+    # --------------------------------------------------------
+    # ACTIONS
+    # --------------------------------------------------------
+
+    def create_actions(self):
+        def action(text, shortcut=None, slot=None, checkable=False):
+            a = QAction(text, self)
+            if shortcut:
+                a.setShortcut(shortcut)
+            a.setCheckable(checkable)
+            if slot:
+                a.triggered.connect(slot)
+            return a
+
+        self.new_action = action("New", "Ctrl+N", self.new_document)
+        self.open_action = action("Open...", "Ctrl+O", self.open_document)
+        self.save_action = action("Save", "Ctrl+S", self.save_document)
+        self.save_as_action = action("Save As...", None, self.save_as)
+        self.exit_action = action("Exit", "Ctrl+Q", self.close)
+
+        self.undo_action = action("Undo", "Ctrl+Z", self.editor.undo)
+        self.redo_action = action("Redo", "Ctrl+Y", self.editor.redo)
+        self.cut_action = action("Cut", "Ctrl+X", self.editor.cut)
+        self.copy_action = action("Copy", "Ctrl+C", self.editor.copy)
+        self.paste_action = action("Paste", "Ctrl+V", self.editor.paste)
+        self.select_all_action = action("Select All", "Ctrl+A", self.editor.selectAll)
+        self.find_action = action("Find & Replace", "Ctrl+H", self.show_find_replace)
+
+        self.bold_action = action("Bold", "Ctrl+B", self.toggle_bold, True)
+        self.italic_action = action("Italic", "Ctrl+I", self.toggle_italic, True)
+        self.underline_action = action("Underline", "Ctrl+U", self.toggle_underline, True)
+        self.strike_action = action("Strikethrough", "Ctrl+Shift+X", self.toggle_strike, True)
+
+        self.color_action = action("Text Color", None, self.change_text_color)
+        self.highlight_action = action("Highlight", None, self.highlight_text)
+        self.clear_format_action = action("Clear Formatting", None, self.clear_formatting)
+
+        self.left_action = action(
+            "Left", None,
+            lambda: self.set_alignment(Qt.AlignmentFlag.AlignLeft)
+        )
+        self.center_action = action(
+            "Center", None,
+            lambda: self.set_alignment(Qt.AlignmentFlag.AlignCenter)
+        )
+        self.right_action = action(
+            "Right", None,
+            lambda: self.set_alignment(Qt.AlignmentFlag.AlignRight)
+        )
+        self.justify_action = action(
+            "Justify", None,
+            lambda: self.set_alignment(Qt.AlignmentFlag.AlignJustify)
+        )
+
+        self.bullet_action = action("Bullets", None, self.toggle_bullets)
+        self.number_action = action("Numbering", None, self.toggle_numbering)
+
+        self.image_action = action("Insert Image", None, self.insert_image)
+        self.table_action = action("Insert Table", None, self.insert_table)
+        self.link_action = action("Insert Link", "Ctrl+K", self.insert_link)
+        self.page_break_action = action("Page Break", None, self.insert_page_break)
+
+        self.header_action = action("Set Header", None, self.set_header)
+        self.footer_action = action("Set Footer", None, self.set_footer)
+
+        self.about_action = action("About MyWord", None, self.show_about)
+
+    # --------------------------------------------------------
+    # MENUS
+    # --------------------------------------------------------
+
+    def create_menus(self):
+        menu = self.menuBar()
+
+        file_menu = menu.addMenu("File")
+        file_menu.addAction(self.new_action)
+        file_menu.addAction(self.open_action)
+        file_menu.addSeparator()
+        file_menu.addAction(self.save_action)
+        file_menu.addAction(self.save_as_action)
+        file_menu.addSeparator()
+        file_menu.addAction(self.exit_action)
+
+        edit_menu = menu.addMenu("Edit")
+        for a in (
+            self.undo_action, self.redo_action,
+            self.cut_action, self.copy_action,
+            self.paste_action, self.select_all_action,
+            self.find_action,
+        ):
+            edit_menu.addAction(a)
+
+        format_menu = menu.addMenu("Format")
+        for a in (
+            self.bold_action, self.italic_action,
+            self.underline_action, self.strike_action,
+            self.color_action, self.highlight_action,
+            self.clear_format_action,
+        ):
+            format_menu.addAction(a)
+
+        paragraph_menu = menu.addMenu("Paragraph")
+        for a in (
+            self.left_action, self.center_action,
+            self.right_action, self.justify_action,
+            self.bullet_action, self.number_action,
+        ):
+            paragraph_menu.addAction(a)
+
+        insert_menu = menu.addMenu("Insert")
+        for a in (
+            self.image_action,
+            self.table_action,
+            self.link_action,
+            self.page_break_action,
+        ):
+            insert_menu.addAction(a)
+
+        document_menu = menu.addMenu("Document")
+        document_menu.addAction(self.header_action)
+        document_menu.addAction(self.footer_action)
+
+        view_menu = menu.addMenu("View")
+
+        zoom_in = QAction("Zoom In", self)
+        zoom_in.setShortcut("Ctrl++")
+        zoom_in.triggered.connect(self.editor.zoomIn)
+
+        zoom_out = QAction("Zoom Out", self)
+        zoom_out.setShortcut("Ctrl+-")
+        zoom_out.triggered.connect(self.editor.zoomOut)
+
+        zoom_reset = QAction("Reset Zoom", self)
+        zoom_reset.setShortcut("Ctrl+0")
+        zoom_reset.triggered.connect(lambda: self.editor.zoomIn(0))
+
+        view_menu.addAction(zoom_in)
+        view_menu.addAction(zoom_out)
+        view_menu.addAction(zoom_reset)
+
+        help_menu = menu.addMenu("Help")
+        help_menu.addAction(self.about_action)
+
+    # --------------------------------------------------------
+    # TOOLBAR
+    # --------------------------------------------------------
+
+    def create_toolbar(self):
+        toolbar = QToolBar("Formatting")
+        toolbar.setMovable(False)
+        self.addToolBar(toolbar)
+
+        for a in (
+            self.new_action, self.open_action, self.save_action,
+        ):
+            toolbar.addAction(a)
+
+        toolbar.addSeparator()
+
+        toolbar.addAction(self.undo_action)
+        toolbar.addAction(self.redo_action)
+
+        toolbar.addSeparator()
+
+        self.font_combo = QComboBox()
+        self.font_combo.setEditable(True)
+        self.font_combo.setMinimumWidth(150)
+        self.font_combo.addItems([
+            "Arial", "Calibri", "Times New Roman",
+            "Georgia", "Verdana", "Courier New",
+            "Tahoma", "Helvetica",
+        ])
+        self.font_combo.currentTextChanged.connect(self.change_font)
+        toolbar.addWidget(self.font_combo)
+
+        self.size_combo = QComboBox()
+        self.size_combo.setEditable(True)
+        self.size_combo.setMinimumWidth(70)
+        self.size_combo.addItems([
+            "8", "9", "10", "11", "12", "14", "16",
+            "18", "20", "24", "28", "32", "36", "48", "72",
+        ])
+        self.size_combo.setCurrentText("12")
+        self.size_combo.currentTextChanged.connect(self.change_font_size)
+        toolbar.addWidget(self.size_combo)
+
+        toolbar.addSeparator()
+
+        for a in (
+            self.bold_action, self.italic_action,
+            self.underline_action, self.strike_action,
+        ):
+            toolbar.addAction(a)
+
+        toolbar.addSeparator()
+
+        toolbar.addAction(self.color_action)
+        toolbar.addAction(self.highlight_action)
+        toolbar.addAction(self.clear_format_action)
+
+        toolbar.addSeparator()
+
+        for a in (
+            self.left_action, self.center_action,
+            self.right_action, self.justify_action,
+        ):
+            toolbar.addAction(a)
+
+        toolbar.addSeparator()
+
+        toolbar.addAction(self.bullet_action)
+        toolbar.addAction(self.number_action)
+
+        toolbar.addSeparator()
+
+        toolbar.addAction(self.image_action)
+        toolbar.addAction(self.table_action)
+        toolbar.addAction(self.link_action)
+        toolbar.addAction(self.page_break_action)
+
+        toolbar.addSeparator()
+        toolbar.addAction(self.find_action)
+
+    # --------------------------------------------------------
+    # STATUS BAR
+    # --------------------------------------------------------
+
+    def create_statusbar(self):
+        status = QStatusBar()
+        self.setStatusBar(status)
+
+        self.word_label = QLabel("Words: 0")
+        self.char_label = QLabel("Characters: 0")
+        self.page_label = QLabel("Pages: 1")
+
+        status.addPermanentWidget(self.page_label)
+        status.addPermanentWidget(self.word_label)
+        status.addPermanentWidget(self.char_label)
+
+    # --------------------------------------------------------
+    # NEW
+    # --------------------------------------------------------
+
+    def new_document(self, force=False):
+        if not force and not self.check_unsaved_changes():
+            return
+
+        self.loading = True
+        self.editor.clear()
+        self.loading = False
+
+        self.current_file = None
+        self.modified = False
+        self.document_header = ""
+        self.document_footer = ""
+
+        self.editor.document().setModified(False)
+        self.update_title()
+        self.update_word_count()
+
+    # --------------------------------------------------------
+    # OPEN
+    # --------------------------------------------------------
+
+    def open_document(self):
+        if not self.check_unsaved_changes():
+            return
+
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Document",
+            "",
+            "Word Documents (*.docx);;Text Files (*.txt);;All Files (*)",
+        )
+
+        if path:
+            self.open_file_path(path)
+
+    def open_file_path(self, path):
+        path = os.path.abspath(os.path.expanduser(str(path)))
+
+        if not os.path.isfile(path):
+            QMessageBox.warning(
+                self,
+                "File Not Found",
+                f"The file does not exist:\n\n{path}",
+            )
+            return False
+
+        try:
+            extension = Path(path).suffix.lower()
+
+            if extension == ".docx":
+                self.load_docx(path)
+            elif extension == ".txt":
+                with open(path, "r", encoding="utf-8") as f:
+                    self.loading = True
+                    self.editor.setPlainText(f.read())
+                    self.loading = False
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Unsupported File",
+                    "MyWord V2 supports .docx and .txt files.",
+                )
+                return False
+
+            self.current_file = path
+            self.modified = False
+            self.editor.document().setModified(False)
+            self.update_title()
+            self.update_word_count()
+            return True
+
+        except Exception as e:
+            self.loading = False
+            QMessageBox.critical(
+                self,
+                "Open Error",
+                f"Could not open the document:\n\n{e}",
+            )
+            return False
+
+    # --------------------------------------------------------
+    # DOCX LOAD
+    # --------------------------------------------------------
+
+    def load_docx(self, path):
+        docx = Document(path)
+
+        self.loading = True
+        self.editor.clear()
+        self.document_header = ""
+        self.document_footer = ""
+
+        cursor = self.editor.textCursor()
+
+        # Headers / footers
+        try:
+            if docx.sections:
+                section = docx.sections[0]
+                self.document_header = "\n".join(
+                    p.text for p in section.header.paragraphs
+                ).strip()
+                self.document_footer = "\n".join(
+                    p.text for p in section.footer.paragraphs
+                ).strip()
+        except Exception:
+            pass
+
+        # Document body in XML order: paragraphs + tables.
+        body = docx._element.body
+
+        for child in body.iterchildren():
+            tag = child.tag.split("}")[-1]
+
+            if tag == "p":
+                paragraph = next(
+                    (p for p in docx.paragraphs if p._p is child),
+                    None,
+                )
+                if paragraph is not None:
+                    self._load_paragraph(paragraph, cursor)
+
+            elif tag == "tbl":
+                table = next(
+                    (t for t in docx.tables if t._tbl is child),
+                    None,
+                )
+                if table is not None:
+                    self._load_table(table, cursor)
+
+        self.loading = False
+        self.editor.document().setModified(False)
+
+    def _load_paragraph(self, paragraph, cursor):
+        block_format = QTextBlockFormat()
+
+        if paragraph.alignment == WD_ALIGN_PARAGRAPH.CENTER:
+            alignment = Qt.AlignmentFlag.AlignCenter
+        elif paragraph.alignment == WD_ALIGN_PARAGRAPH.RIGHT:
+            alignment = Qt.AlignmentFlag.AlignRight
+        elif paragraph.alignment == WD_ALIGN_PARAGRAPH.JUSTIFY:
+            alignment = Qt.AlignmentFlag.AlignJustify
+        else:
+            alignment = Qt.AlignmentFlag.AlignLeft
+
+        block_format.setAlignment(alignment)
+        cursor.setBlockFormat(block_format)
+
+        # Handle runs and embedded drawings/images.
+        for child in paragraph._p.iterchildren():
+            tag = child.tag.split("}")[-1]
+
+            if tag == "r":
+                run = None
+                for candidate in paragraph.runs:
+                    if candidate._r is child:
+                        run = candidate
+                        break
+
+                if run is None:
+                    continue
+
+                # Image?
+                drawing = child.find(qn("w:drawing"))
+                pict = child.find(qn("w:pict"))
+
+                if drawing is not None or pict is not None:
+                    image = self._extract_run_image(run, paragraph.part)
+                    if image is not None:
+                        self._insert_loaded_image(cursor, image)
+                    continue
+
+                self._insert_run(cursor, run)
+
+            elif tag == "hyperlink":
+                self._insert_hyperlink_element(
+                    paragraph,
+                    child,
+                    cursor,
+                )
+
+        # Paragraph break
+        cursor.insertText("\n")
+
+        # Page break in paragraph
+        if "page" in paragraph.text.lower():
+            pass
+
+    def _insert_run(self, cursor, run):
+        text = run.text or ""
+
+        if not text:
+            return
+
+        fmt = QTextCharFormat()
+
+        if run.bold:
+            fmt.setFontWeight(QFont.Weight.Bold)
+        if run.italic:
+            fmt.setFontItalic(True)
+        if run.underline:
+            fmt.setFontUnderline(True)
+        if run.font.strike:
+            fmt.setFontStrikeOut(True)
+
+        if run.font.name:
+            fmt.setFontFamilies([run.font.name])
+
+        if run.font.size:
+            fmt.setFontPointSize(run.font.size.pt)
+
+        rgb = rgb_from_run(run)
+        if rgb and len(rgb) == 6:
+            fmt.setForeground(QColor("#" + rgb))
+
+        try:
+            if run.font.highlight_color:
+                # python-docx uses enum names; use a safe default.
+                fmt.setBackground(QColor("#FFF59D"))
+        except Exception:
+            pass
+
+        cursor.insertText(text, fmt)
+
+    def _extract_run_image(self, run, part):
+        try:
+            blips = run._r.xpath(".//a:blip")
+            if not blips:
+                return None
+
+            rid = blips[0].get(
+                "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed"
+            )
+            if not rid:
+                return None
+
+            image_part = part.related_parts[rid]
+            data = image_part.blob
+
+            image = QImage()
+            if image.loadFromData(data):
+                return image
+
+        except Exception:
+            return None
+
+        return None
+
+    def _insert_loaded_image(self, cursor, image):
+        resource_id = f"memory-image:{id(image)}"
+        self.editor.document().addResource(
+            QTextDocument.ResourceType.ImageResource,
+            resource_id,
+            image,
+        )
+
+        fmt = QTextImageFormat()
+        fmt.setName(resource_id)
+
+        max_width = 600
+        if image.width() > max_width:
+            scale = max_width / image.width()
+            fmt.setWidth(max_width)
+            fmt.setHeight(image.height() * scale)
+        else:
+            fmt.setWidth(image.width())
+            fmt.setHeight(image.height())
+
+        cursor.insertImage(fmt)
+
+    def _insert_hyperlink_element(self, paragraph, element, cursor):
+        text = "".join(
+            t.text or ""
+            for t in element.iter()
+            if t.tag.split("}")[-1] == "t"
+        )
+
+        if not text:
+            return
+
+        rid = element.get(
+            "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+        )
+
+        url = ""
+        if rid:
+            try:
+                url = paragraph.part.rels[rid].target_ref
+            except Exception:
+                pass
+
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor("#0563C1"))
+        fmt.setFontUnderline(True)
+
+        if url:
+            fmt.setAnchor(True)
+            fmt.setAnchorHref(url)
+
+        cursor.insertText(text, fmt)
+
+    def _load_table(self, table, cursor):
+        rows = len(table.rows)
+        cols = max((len(r.cells) for r in table.rows), default=1)
+
+        if rows <= 0 or cols <= 0:
+            return
+
+        qt_table = cursor.insertTable(rows, cols)
+
+        for r, row in enumerate(table.rows):
+            for c, cell in enumerate(row.cells):
+                cell_cursor = qt_table.cellAt(r, c).firstCursorPosition()
+                cell_cursor.insertText(cell.text)
+
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertText("\n")
+
+    # --------------------------------------------------------
+    # SAVE
+    # --------------------------------------------------------
+
+    def save_document(self):
+        if not self.current_file:
+            return self.save_as()
+
+        try:
+            extension = Path(self.current_file).suffix.lower()
+
+            if extension == ".docx":
+                self.save_docx(self.current_file)
+            elif extension == ".txt":
+                with open(self.current_file, "w", encoding="utf-8") as f:
+                    f.write(self.editor.toPlainText())
+            else:
+                return self.save_as()
+
+            self.modified = False
+            self.editor.document().setModified(False)
+            self.update_title()
+
+            self.statusBar().showMessage("Document saved.", 3000)
+            return True
+
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Save Error",
+                f"Could not save the document:\n\n{e}",
+            )
+            return False
+
+    def save_as(self):
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Save Document",
+            "",
+            "Word Document (*.docx);;Text File (*.txt)",
+        )
+
+        if not path:
+            return False
+
+        if "Word" in selected_filter and not path.lower().endswith(".docx"):
+            path += ".docx"
+        elif "Text" in selected_filter and not path.lower().endswith(".txt"):
+            path += ".txt"
+
+        self.current_file = os.path.abspath(path)
+        return self.save_document()
+
+    # --------------------------------------------------------
+    # DOCX SAVE
+    # --------------------------------------------------------
+
+    def save_docx(self, path):
+        document = Document()
+
+        # Remove default paragraph.
+        if document.paragraphs:
+            p = document.paragraphs[0]._element
+            p.getparent().remove(p)
+
+        # Header / footer
+        try:
+            section = document.sections[0]
+            if self.document_header:
+                hp = section.header.paragraphs[0]
+                hp.text = self.document_header
+
+            if self.document_footer:
+                fp = section.footer.paragraphs[0]
+                fp.text = self.document_footer
+        except Exception:
+            pass
+
+        doc = self.editor.document()
+        block = doc.begin()
+
+        while block.isValid():
+            paragraph = document.add_paragraph()
+
+            alignment = block.blockFormat().alignment()
+
+            if alignment & Qt.AlignmentFlag.AlignCenter:
+                paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            elif alignment & Qt.AlignmentFlag.AlignRight:
+                paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            elif alignment & Qt.AlignmentFlag.AlignJustify:
+                paragraph.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            else:
+                paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+
+            iterator = block.begin()
+
+            while not iterator.atEnd():
+                fragment = iterator.fragment()
+
+                if fragment.isValid():
+                    text = fragment.text()
+                    fmt = fragment.charFormat()
+
+                    # Embedded image
+                    if fmt.isImageFormat():
+                        self._save_fragment_image(
+                            document,
+                            paragraph,
+                            fmt.toImageFormat(),
+                        )
+
+                    elif text:
+                        self._save_text_fragment(
+                            paragraph,
+                            text,
+                            fmt,
+                        )
+
+                iterator += 1
+
+            block = block.next()
+
+        document.save(path)
+
+    def _save_text_fragment(self, paragraph, text, fmt):
+        url = fmt.anchorHref()
+
+        if fmt.isAnchor() and url:
+            add_hyperlink(paragraph, text, url)
+            return
+
+        run = paragraph.add_run(text)
+
+        families = fmt.fontFamilies()
+        if families:
+            run.font.name = families[0]
+
+        if fmt.fontPointSize() > 0:
+            run.font.size = Pt(fmt.fontPointSize())
+
+        run.bold = fmt.fontWeight() >= QFont.Weight.Bold
+        run.italic = fmt.fontItalic()
+        run.underline = fmt.fontUnderline()
+        run.font.strike = fmt.fontStrikeOut()
+
+        color = fmt.foreground().color()
+        if color.isValid():
+            run.font.color.rgb = RGBColor(
+                color.red(),
+                color.green(),
+                color.blue(),
+            )
+
+    def _save_fragment_image(self, document, paragraph, image_format):
+        name = image_format.name()
+        image = self.editor.document().resource(
+            QTextDocument.ResourceType.ImageResource,
+            QUrl(name),
+        )
+
+        if image is None:
+            image = self.editor.document().resource(
+                QTextDocument.ResourceType.ImageResource,
+                name,
+            )
+
+        if isinstance(image, QImage) and not image.isNull():
+            temp_dir = Path(tempfile.gettempdir()) / "myword_images"
+            temp_dir.mkdir(exist_ok=True)
+            temp_file = temp_dir / f"{abs(hash(name))}.png"
+            image.save(str(temp_file), "PNG")
+
+            run = paragraph.add_run()
+            run.add_picture(str(temp_file))
+
+    # --------------------------------------------------------
+    # FORMATTING
+    # --------------------------------------------------------
+
+    def merge_format(self, fmt):
+        cursor = self.editor.textCursor()
+
+        if cursor.hasSelection():
+            cursor.mergeCharFormat(fmt)
+        else:
+            self.editor.mergeCurrentCharFormat(fmt)
+
+    def toggle_bold(self):
+        fmt = QTextCharFormat()
+        current = self.editor.textCursor().charFormat().fontWeight()
+        fmt.setFontWeight(
+            QFont.Weight.Normal
+            if current >= QFont.Weight.Bold
+            else QFont.Weight.Bold
+        )
+        self.merge_format(fmt)
+
+    def toggle_italic(self):
+        fmt = QTextCharFormat()
+        fmt.setFontItalic(
+            not self.editor.textCursor().charFormat().fontItalic()
+        )
+        self.merge_format(fmt)
+
+    def toggle_underline(self):
+        fmt = QTextCharFormat()
+        fmt.setFontUnderline(
+            not self.editor.textCursor().charFormat().fontUnderline()
+        )
+        self.merge_format(fmt)
+
+    def toggle_strike(self):
+        fmt = QTextCharFormat()
+        fmt.setFontStrikeOut(
+            not self.editor.textCursor().charFormat().fontStrikeOut()
+        )
+        self.merge_format(fmt)
+
+    def change_font(self, font):
+        if font:
+            fmt = QTextCharFormat()
+            fmt.setFontFamilies([font])
+            self.merge_format(fmt)
+
+    def change_font_size(self, size):
+        try:
+            value = float(size)
+        except ValueError:
+            return
+
+        if value <= 0:
+            return
+
+        fmt = QTextCharFormat()
+        fmt.setFontPointSize(value)
+        self.merge_format(fmt)
+
+    def change_text_color(self):
+        color = QColorDialog.getColor(self, "Text Color")
+        if color.isValid():
+            fmt = QTextCharFormat()
+            fmt.setForeground(color)
+            self.merge_format(fmt)
+
+    def highlight_text(self):
+        color = QColorDialog.getColor(self, "Highlight Color")
+        if color.isValid():
+            fmt = QTextCharFormat()
+            fmt.setBackground(color)
+            self.merge_format(fmt)
+
+    def clear_formatting(self):
+        cursor = self.editor.textCursor()
+        if cursor.hasSelection():
+            cursor.setCharFormat(QTextCharFormat())
+
+    # --------------------------------------------------------
+    # PARAGRAPHS
+    # --------------------------------------------------------
+
+    def set_alignment(self, alignment):
+        cursor = self.editor.textCursor()
+        fmt = QTextBlockFormat()
+        fmt.setAlignment(alignment)
+        cursor.mergeBlockFormat(fmt)
+        self.editor.setTextCursor(cursor)
+
+    def toggle_bullets(self):
+        self.editor.textCursor().createList(
+            QTextListFormat.Style.ListDisc
+        )
+
+    def toggle_numbering(self):
+        self.editor.textCursor().createList(
+            QTextListFormat.Style.ListDecimal
+        )
+
+    # --------------------------------------------------------
+    # IMAGE
+    # --------------------------------------------------------
+
+    def insert_image(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Insert Image",
+            "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.gif *.webp *.svg)",
+        )
+
+        if not path:
+            return
+
+        image = QImage(path)
+
+        if image.isNull():
+            QMessageBox.warning(
+                self,
+                "Image Error",
+                "Could not load this image.",
+            )
+            return
+
+        self._insert_loaded_image(
+            self.editor.textCursor(),
+            image,
+        )
+
+    # --------------------------------------------------------
+    # TABLE
+    # --------------------------------------------------------
+
+    def insert_table(self):
+        rows, ok = QInputDialog.getInt(
+            self, "Insert Table", "Rows:", 3, 1, 100
+        )
+        if not ok:
+            return
+
+        columns, ok = QInputDialog.getInt(
+            self, "Insert Table", "Columns:", 3, 1, 30
+        )
+        if not ok:
+            return
+
+        self.editor.textCursor().insertTable(rows, columns)
+
+    # --------------------------------------------------------
+    # HYPERLINK
+    # --------------------------------------------------------
+
+    def insert_link(self):
+        cursor = self.editor.textCursor()
+
+        if cursor.hasSelection():
+            text = cursor.selectedText()
+        else:
+            text, ok = QInputDialog.getText(
+                self,
+                "Insert Link",
+                "Link text:",
+            )
+            if not ok or not text:
+                return
+            cursor.insertText(text)
+            cursor.movePosition(
+                QTextCursor.MoveOperation.Left,
+                QTextCursor.MoveMode.KeepAnchor,
+                len(text),
+            )
+
+        url, ok = QInputDialog.getText(
+            self,
+            "Insert Link",
+            "URL:",
+            text="https://",
+        )
+
+        if not ok or not url:
+            return
+
+        fmt = QTextCharFormat()
+        fmt.setAnchor(True)
+        fmt.setAnchorHref(url)
+        fmt.setForeground(QColor("#0563C1"))
+        fmt.setFontUnderline(True)
+        cursor.mergeCharFormat(fmt)
+
+    # --------------------------------------------------------
+    # PAGE BREAK
+    # --------------------------------------------------------
+
+    def insert_page_break(self):
+        cursor = self.editor.textCursor()
+        cursor.insertText("\n")
+        cursor.insertBlock()
+        cursor.insertText("\f")
+
+    # --------------------------------------------------------
+    # HEADER / FOOTER
+    # --------------------------------------------------------
+
+    def set_header(self):
+        text, ok = QInputDialog.getMultiLineText(
+            self,
+            "Document Header",
+            "Header text:",
+            self.document_header,
+        )
+
+        if ok:
+            self.document_header = text
+            self.modified = True
+            self.update_title()
+
+    def set_footer(self):
+        text, ok = QInputDialog.getMultiLineText(
+            self,
+            "Document Footer",
+            "Footer text:",
+            self.document_footer,
+        )
+
+        if ok:
+            self.document_footer = text
+            self.modified = True
+            self.update_title()
+
+    # --------------------------------------------------------
+    # FIND
+    # --------------------------------------------------------
+
+    def show_find_replace(self):
+        FindReplaceDialog(self.editor, self).exec()
+
+    # --------------------------------------------------------
+    # STATE
+    # --------------------------------------------------------
+
+    def document_changed(self):
+        if self.loading:
+            return
+
+        self.modified = True
+        self.update_title()
+        self.update_word_count()
+
+    def update_title(self):
+        filename = (
+            os.path.basename(self.current_file)
+            if self.current_file
+            else "Untitled"
+        )
+        marker = "* " if self.modified else ""
+        self.setWindowTitle(f"{marker}{filename} - {APP_NAME}")
+
+    def update_word_count(self):
+        text = self.editor.toPlainText()
+
+        words = re.findall(
+            r"\b[\w'-]+\b",
+            text,
+            flags=re.UNICODE,
+        )
+
+        self.word_label.setText(f"Words: {len(words)}")
+        self.char_label.setText(f"Characters: {len(text)}")
+
+        # QTextDocument does not expose true Word-style pages here.
+        # Estimate based on printable text until the page-layout engine
+        # is introduced.
+        pages = max(1, (len(text) // 2200) + 1)
+        self.page_label.setText(f"Pages: {pages}")
+
+    def update_toolbar(self):
+        cursor = self.editor.textCursor()
+        fmt = cursor.charFormat()
+
+        self.bold_action.blockSignals(True)
+        self.bold_action.setChecked(
+            fmt.fontWeight() >= QFont.Weight.Bold
+        )
+        self.bold_action.blockSignals(False)
+
+        self.italic_action.blockSignals(True)
+        self.italic_action.setChecked(fmt.fontItalic())
+        self.italic_action.blockSignals(False)
+
+        self.underline_action.blockSignals(True)
+        self.underline_action.setChecked(fmt.fontUnderline())
+        self.underline_action.blockSignals(False)
+
+        self.strike_action.blockSignals(True)
+        self.strike_action.setChecked(fmt.fontStrikeOut())
+        self.strike_action.blockSignals(False)
+
+        families = fmt.fontFamilies()
+        if families:
+            self.font_combo.blockSignals(True)
+            self.font_combo.setCurrentText(families[0])
+            self.font_combo.blockSignals(False)
+
+        size = fmt.fontPointSize()
+        if size > 0:
+            self.size_combo.blockSignals(True)
+            self.size_combo.setCurrentText(str(int(size)))
+            self.size_combo.blockSignals(False)
+
+    # --------------------------------------------------------
+    # UNSAVED CHANGES
+    # --------------------------------------------------------
+
+    def check_unsaved_changes(self):
+        if not self.modified:
+            return True
+
+        result = QMessageBox.question(
+            self,
+            "Unsaved Changes",
+            "This document has unsaved changes.\n\n"
+            "Do you want to save them?",
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+        )
+
+        if result == QMessageBox.StandardButton.Save:
+            return self.save_document()
+
+        if result == QMessageBox.StandardButton.Cancel:
+            return False
+
+        return True
+
+    # --------------------------------------------------------
+    # ABOUT
+    # --------------------------------------------------------
+
+    def show_about(self):
+        QMessageBox.about(
+            self,
+            "About MyWord",
+            f"""
+            <h2>{APP_NAME}</h2>
+            <p><b>Version {VERSION}</b></p>
+            <p>A lightweight Word-compatible document editor.</p>
+            <p>Built with Python, PySide6 and python-docx.</p>
+            """,
+        )
+
+    # --------------------------------------------------------
+    # CLOSE
+    # --------------------------------------------------------
+
+    def closeEvent(self, event):
+        if self.check_unsaved_changes():
+            event.accept()
+        else:
+            event.ignore()
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setOrganizationName(APP_NAME)
+
+    window = MyWord()
+
+    # Windows / command-line file opening:
+    # MyWord.exe "C:\Documents\example.docx"
+    if len(sys.argv) > 1:
+        file_path = sys.argv[1].strip('"')
+        if os.path.isfile(file_path):
+            window.open_file_path(file_path)
+
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
